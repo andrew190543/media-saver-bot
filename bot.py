@@ -21,9 +21,15 @@ async def main() -> None:
     session: AiohttpSession | None = None
     if settings.USE_LOCAL_BOT_API:
         session = AiohttpSession(
-            api=TelegramAPIServer.from_base(settings.LOCAL_BOT_API_URL, is_local=True)
+            api=TelegramAPIServer.from_base(settings.LOCAL_BOT_API_URL, is_local=True),
+            proxy=settings.TELEGRAM_PROXY_URL or None,
         )
         logging.info("Using Local Telegram Bot API Server at %s", settings.LOCAL_BOT_API_URL)
+    else:
+        session = AiohttpSession(
+            api=TelegramAPIServer.from_base("https://api.telegram.org"),
+            proxy=settings.TELEGRAM_PROXY_URL or None,
+        )
 
     bot = Bot(token=settings.BOT_TOKEN, session=session)
     dp = Dispatcher()

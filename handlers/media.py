@@ -41,7 +41,7 @@ def format_duration(seconds: int) -> str:
     mins, secs = divmod(seconds, 60)
     hours, mins = divmod(mins, 60)
     if hours:
-        return f"{hours}:{mins:02d}:{secs:02d}"
+        return f"{hours:02d}:{mins:02d}:{secs:02d}"
     return f"{mins}:{secs:02d}"
 
 
@@ -84,9 +84,7 @@ async def handle_link_message(message: Message) -> None:
         thumbnail=meta.thumbnail_url or "",
     )
 
-    is_oversized = (
-        meta.filesize_approx > settings.max_filesize_bytes and not settings.USE_LOCAL_BOT_API
-    )
+    is_oversized = meta.filesize_approx > settings.effective_max_filesize_bytes
 
     caption_lines = [
         f"📌 <b>{html.escape(meta.title[:180])}</b>",
@@ -98,8 +96,12 @@ async def handle_link_message(message: Message) -> None:
         caption_lines.append(f"📦 Ожидаемый размер: <b>{format_size(meta.filesize_approx)}</b>")
 
     if is_oversized:
+        limit_mb = (
+            settings.LOCAL_MAX_FILESIZE_MB if settings.USE_LOCAL_BOT_API else settings.MAX_FILESIZE_MB
+        )
         caption_lines.append(
-            "\n⚠️ <b>Внимание:</b> Оригинальный файл превышает лимит стандартного Bot API (48 МБ).\n"
+            "\n⚠️ <b>Внимание:</b> Оригинальный файл превышает лимит отправки Telegram Bot API "
+            f"({limit_mb} МБ).\n"
             "Выберите <b>480p</b>, <b>MP3</b>, <b>Двухпроходное сжатие FFmpeg</b> или подключите "
             "<i>Local Telegram Bot API Server</i>."
         )
@@ -254,23 +256,23 @@ async def handle_download_callback(
             main_file = result.files[0]
 
             if result.media_type == "video" and (
-                action == "compress" or main_file.stat().st_size > settings.max_filesize_bytes
+                action == "compress" or main_file.stat().st_size > settings.effective_max_filesize_bytes
             ):
-                if not (settings.USE_LOCAL_BOT_API and action != "compress"):
-                    await update_status(
-                        msg,
-                        "⚡ <b>Конвертация и двухпроходное сжатие FFmpeg до 48 МБ...</b>",
-                    )
-                    main_file = await downloader.compress_video_to_limit(
-                        main_file,
-                        duration=result.duration or duration,
-                        target_mb=settings.MAX_FILESIZE_MB - 1,
-                    )
-
-            if main_file.stat().st_size > settings.max_filesize_bytes:
                 await update_status(
                     msg,
-                    f"⚠️ <b>Файл ({format_size(main_file.stat().st_size)}) превышает лимит {settings.MAX_FILESIZE_MB} МБ.</b>",
+                    "⚡ <b>Конвертация и двухпроходное сжатие FFmpeg до 48 МБ...</b>",
+                )
+                main_file = await downloader.compress_video_to_limit(
+                    main_file,
+                    duration=result.duration or duration,
+                    target_mb=settings.MAX_FILESIZE_MB - 1,
+                )
+
+            if main_file.stat().st_size > settings.effective_max_filesize_bytes:
+                await update_status(
+                    msg,
+                    f"⚠️ <b>Файл ({format_size(main_file.stat().st_size)}) превышает лимит "
+                    f"{settings.effective_max_filesize_bytes / (1024 * 1024):.0f} МБ.</b>",
                 )
                 return
 

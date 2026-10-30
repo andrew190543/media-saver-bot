@@ -6,8 +6,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     BOT_TOKEN: str
 
-    PROXY_ENABLED: bool = False
-    PROXY_URL: str = ""
+    PROXY_ENABLED: bool = True
+    PROXY_URL: str = "socks5://127.0.0.1:1080"
     PROXY_DOMAINS: str = (
         "youtube.com,youtu.be,instagram.com,twitter.com,x.com,"
         "soundcloud.com,pinterest.com,pin.it,tiktok.com"
@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     MAX_FILESIZE_MB: int = 48
     USE_LOCAL_BOT_API: bool = False
     LOCAL_BOT_API_URL: str = "http://telegram-bot-api:8081"
+    LOCAL_MAX_FILESIZE_MB: int = 1950
+
+    TELEGRAM_PROXY_URL: str = "socks5://127.0.0.1:1443"
 
     DB_PATH: str = "data/bot.sqlite3"
     TEMP_DIR: str = "/tmp/media_saver_bot"
@@ -35,6 +38,16 @@ class Settings(BaseSettings):
     @property
     def max_filesize_bytes(self) -> int:
         return self.MAX_FILESIZE_MB * 1024 * 1024
+
+    @property
+    def effective_max_filesize_bytes(self) -> int:
+        """Реальный лимит отправки медиа в Telegram.
+
+        Стандартный Bot API принимает файлы до 48 МБ, а Local Telegram Bot API Server — до ~1950 МБ.
+        """
+        if self.USE_LOCAL_BOT_API:
+            return self.LOCAL_MAX_FILESIZE_MB * 1024 * 1024
+        return self.max_filesize_bytes
 
     @property
     def proxy_domain_list(self) -> List[str]:
