@@ -1,14 +1,24 @@
 services:
   bot:
-    build: .
+    image: ghcr.io/andrew190543/media-saver-bot:latest
+    # Для локальной сборки замените image на build: .
+    # и запускайте: docker compose up -d --build
     container_name: media_saver_bot
     restart: unless-stopped
     env_file:
       - .env
+    # Локальные прокси (V2Ray / TgWsProxy) запущены на хосте, а не в контейнере.
+    # Адрес host.docker.internal пробрасывается через host-gateway ниже.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
+      # Создайте пустой cookies.txt, если cookies не используются,
+      # иначе Docker создаст на этом месте каталог.
       - ./cookies.txt:/app/cookies.txt:ro
       - bot_temp:/tmp/media_saver_bot
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
 
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
@@ -17,13 +27,30 @@ services:
     profiles: ["local-api"]
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-0}
-      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-""}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       TELEGRAM_LOCAL: 1
     volumes:
       - telegram_api_data:/var/lib/telegram-bot-api
       - bot_temp:/tmp/media_saver_bot:ro
     ports:
       - "8081:8081"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_POLL_INTERVAL: "300"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_TIMEOUT: "30s"
+      # Если GHCR-пакет приватный, раскомментируйте и добавьте в .env:
+      # GHCR_USER=your_github_login
+      # GHCR_TOKEN=ghp_...  # PAT с правом read:packages
+      # REPO_USER: ${GHCR_USER}
+      # REPO_PASS: ${GHCR_TOKEN}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   bot_temp:

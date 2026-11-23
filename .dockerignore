@@ -1,0 +1,15 @@
+.git/
+.github/
+.env
+.env.*
+data/
+cookies.txt
+*.sqlite3
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+*.zip
+docker-compose.yml
+README.md
