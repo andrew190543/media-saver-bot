@@ -1,26 +1,41 @@
 services:
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: media-saver-xray
+    restart: unless-stopped
+    volumes:
+      - /DATA/AppData/xray:/usr/local/etc/xray:ro
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
   bot:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: media-saver-bot:local
+    image: ghcr.io/andrew190543/media-saver-bot:latest
     container_name: media_saver_bot
     restart: unless-stopped
     stop_grace_period: 25s
+    network_mode: "service:xray"
+    depends_on:
+      - xray
     env_file:
       - .env
-    # Локальные прокси (V2Ray / TgWsProxy) запущены на хосте, а не в контейнере.
-    # Адрес host.docker.internal пробрасывается через host-gateway ниже.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
-      - ./data:/app/data
-      # Создайте пустой cookies.txt, если cookies не используются,
-      # иначе Docker создаст на этом месте каталог.
-      - ./cookies.txt:/app/cookies.txt:ro
+      # Папка данных на хосте должна принадлежать UID/GID 10001:
+      # sudo mkdir -p /DATA/AppData/media-saver-bot/data && sudo chown -R 10001:10001 /DATA/AppData/media-saver-bot/data
+      - /DATA/AppData/media-saver-bot/data:/app/data
+      # Создайте пустой cookies.txt до старта, иначе Docker создаст каталог:
+      # touch /DATA/AppData/media-saver-bot/cookies.txt && chmod 644 /DATA/AppData/media-saver-bot/cookies.txt
+      - /DATA/AppData/media-saver-bot/cookies.txt:/app/cookies.txt:ro
       - bot_temp:/tmp/media_saver_bot
     labels:
-      - com.centurylinklabs.watchtower.enable=true
+      com.centurylinklabs.watchtower.enable: "true"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
@@ -39,10 +54,13 @@ services:
     ports:
       - "127.0.0.1:8081:8081"
 
+  # На сервере с уже запущенным Watchtower не включайте этот профиль,
+  # чтобы избежать конфликта имени контейнера /watchtower.
   watchtower:
     image: containrrr/watchtower:latest
     container_name: watchtower
     restart: unless-stopped
+    profiles: ["watchtower"]
     environment:
       WATCHTOWER_POLL_INTERVAL: "300"
       WATCHTOWER_CLEANUP: "true"

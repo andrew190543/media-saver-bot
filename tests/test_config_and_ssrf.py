@@ -34,6 +34,7 @@ def test_normalize_aiohttp_proxy():
     assert normalize_aiohttp_proxy("socks5h://127.0.0.1:1080") == "socks5://127.0.0.1:1080"
     assert normalize_aiohttp_proxy("SOCKS4A://127.0.0.1:1080") == "socks4://127.0.0.1:1080"
     assert normalize_aiohttp_proxy("socks5://127.0.0.1:1443") == "socks5://127.0.0.1:1443"
+    assert normalize_aiohttp_proxy("http://127.0.0.1:10809") == "http://127.0.0.1:10809"
 
 
 def test_sanitize_secrets():

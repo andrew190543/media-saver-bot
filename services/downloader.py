@@ -902,9 +902,14 @@ class MediaDownloader:
         timeout = aiohttp.ClientTimeout(total=20, connect=10)
 
         for _ in range(5):
-            connector = (
-                ProxyConnector.from_url(aiohttp_proxy, rdns=True) if aiohttp_proxy else None
-            )
+            if aiohttp_proxy:
+                connector = (
+                    ProxyConnector.from_url(aiohttp_proxy, rdns=True)
+                    if aiohttp_proxy.lower().startswith("socks")
+                    else ProxyConnector.from_url(aiohttp_proxy)
+                )
+            else:
+                connector = None
             async with aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,

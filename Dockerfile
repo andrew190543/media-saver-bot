@@ -25,11 +25,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 
-# Runtime libraries only; curl and unzip stay out of the final image.
+# Runtime dependencies only; curl and unzip stay out of the final image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg gosu \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 10001 -s /bin/bash appuser
+    && groupadd -g 10001 appuser \
+    && useradd -m -u 10001 -g 10001 -s /bin/bash appuser
 
 # Deno is required by yt-dlp's YouTube EJS support.
 RUN apt-get update \
@@ -50,12 +51,10 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY . .
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
-    && chmod +x /usr/local/bin/docker-entrypoint.sh \
-    && mkdir -p /app/data /tmp/media_saver_bot /home/appuser/.cache/deno \
-    && chown -R appuser:appuser /app /tmp/media_saver_bot /home/appuser
+RUN mkdir -p /app/data /tmp/media_saver_bot /home/appuser/.cache/deno \
+    && chown -R 10001:10001 /app /tmp/media_saver_bot /home/appuser
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+USER 10001:10001
+
 CMD ["python", "bot.py"]

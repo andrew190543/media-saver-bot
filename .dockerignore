@@ -13,5 +13,6 @@ tests/
 venv/
 *.log
 *.zip
-docker-compose.yml
+docker-compose*.yml
 README.md
+design_doc.md
