@@ -4,6 +4,7 @@
 .env.*
 data/
 cookies.txt
+cookies.json
 *.sqlite3
 __pycache__/
 *.py[cod]

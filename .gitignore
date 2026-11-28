@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache/
 data/
 cookies.txt
+cookies.json
 *.sqlite3
 *.zip

@@ -76,6 +76,8 @@ def test_classify_formats_4k_does_not_hide_720p_and_no_double_count():
 
 
 def test_portrait_video_selectors_and_classification():
+    from yt_dlp import YoutubeDL
+
     info = {
         "formats": [
             {
@@ -92,8 +94,28 @@ def test_portrait_video_selectors_and_classification():
     assert res["has_720p"] is True
     sel_720 = _format_selector_for_action("720p", 48)
     assert "width<=720" in sel_720
+    assert "height>width" not in sel_720
+    sel_480 = _format_selector_for_action("480p", 48)
+    assert "height>width" not in sel_480
     sel_comp = _format_selector_for_action("compress", 48)
     assert "/best[ext=mp4]/best" in sel_comp
+
+    # Ensure every generated yt-dlp selector compiles cleanly inside YoutubeDL
+    ydl = YoutubeDL({"quiet": True})
+    for action in ("best", "720p", "480p", "compress", "mp3"):
+        ydl.build_format_selector(_format_selector_for_action(action, 48))
+
+
+def test_map_ytdlp_error_no_false_positive_on_packages_or_webpage():
+    from services.downloader import _map_ytdlp_error
+
+    tb = r'File "C:\Users\User\AppData\Local\Packages\Python\YoutubeDL.py"\nERROR: Unable to download webpage'
+    err = _map_ytdlp_error(tb)
+    assert "cookies.txt" not in str(err)
+    assert "Не удалось обработать ссылку" in str(err)
+
+    real_auth = "ERROR: [youtube] xyz: Sign in to confirm your age"
+    assert "cookies.txt" in str(_map_ytdlp_error(real_auth))
 
 
 @pytest.mark.asyncio
@@ -517,8 +539,9 @@ async def test_tiktok_pure_audio_and_pinterest_url_transparent_and_hls_fallback(
         if "--ies" in cmd and "generic" in cmd:
             hls_cmds.append(cmd)
             out_idx = cmd.index("-o") + 1
-            Path(cmd[out_idx]).write_bytes(b"ftypmp42_hls")
-            return 0, b"", b""
+            out_file = Path(cmd[out_idx].replace("%(ext)s", "mp4"))
+            out_file.write_bytes(b"ftypmp42_hls")
+            return 0, (str(out_file) + "\n").encode("utf-8"), b""
         return 1, b"", b"ERROR: [Pinterest] 999111: Unable to download JSON metadata"
 
     async def fake_probe(path):
@@ -539,13 +562,14 @@ async def test_tiktok_pure_audio_and_pinterest_url_transparent_and_hls_fallback(
     hls_dir.mkdir()
     hls_res = await dl.download_ytdlp(
         "https://www.pinterest.com/pin/999111/",
-        "best",
+        "720p",
         hls_dir,
         MediaInfo(url="https://www.pinterest.com/pin/999111/", title="HLS Pin", uploader="P"),
     )
     assert hls_res.media_type == "video"
     assert len(hls_cmds) == 1
     assert "--ies" in hls_cmds[0] and "generic" in hls_cmds[0]
+    assert "--proto" not in hls_cmds[0]
     assert "--proxy" in hls_cmds[0]
 
 

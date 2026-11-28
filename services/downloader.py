@@ -463,17 +463,17 @@ def _format_selector_for_action(action: str, limit_mb: int) -> str:
         "bestvideo[height<=720][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
         "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
         "best[height<=720][ext=mp4]/best[height<=720]/"
-        "bestvideo[width<=720][height>width][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
-        "bestvideo[width<=720][height>width][ext=mp4]+bestaudio[ext=m4a]/"
-        "best[width<=720][height>width]"
+        "bestvideo[width<=720][height>720][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
+        "bestvideo[width<=720][height>720][ext=mp4]+bestaudio[ext=m4a]/"
+        "best[width<=720][height>720]"
     )
     selector_480 = (
         "bestvideo[height<=480][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
         "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
         "best[height<=480][ext=mp4]/best[height<=480]/"
-        "bestvideo[width<=480][height>width][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
-        "bestvideo[width<=480][height>width][ext=mp4]+bestaudio[ext=m4a]/"
-        "best[width<=480][height>width]"
+        "bestvideo[width<=480][height>480][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
+        "bestvideo[width<=480][height>480][ext=mp4]+bestaudio[ext=m4a]/"
+        "best[width<=480][height>480]"
     )
     selector_best = (
         "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
@@ -631,11 +631,27 @@ def _classify_and_estimate_formats(info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_AUTH_YTDLP_RE = re.compile(
+    r"(?:"
+    r"\bsign[\s_-]*in\b"
+    r"|\blog[\s_-]*in\b"
+    r"|\blogin[\s_-]*required\b"
+    r"|\bauthentication[\s_-]*required\b"
+    r"|\bhttp error 401\b"
+    r"|\buse --cookies\b"
+    r"|\bcookies(?: file)? (?:are |is )?(?:required|needed|expired|invalid)\b"
+    r"|\b(?:confirm|verify) your age\b"
+    r"|\bage[\s_-]*(?:restricted|limit|gate|verif)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _map_ytdlp_error(stderr_text: str) -> DownloadUserError:
     low = stderr_text.lower()
     if "private video" in low or "is private" in low:
         return DownloadUserError("Это приватное видео.")
-    if "sign in" in low or "login" in low or "cookies" in low or "age" in low:
+    if _AUTH_YTDLP_RE.search(stderr_text):
         return DownloadUserError("Контент требует авторизации (обновите cookies.txt).")
     if "unavailable" in low or "404" in low or "not found" in low or "been deleted" in low:
         return DownloadUserError("Медиа недоступно или было удалено.")
@@ -1234,10 +1250,19 @@ class MediaDownloader:
                 )
             else:
                 connector = None
+            req_headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                ),
+            }
+            if _is_pinterest_url(source_url) or _is_trusted_pinterest_cdn_url(current_url):
+                req_headers["Referer"] = "https://www.pinterest.com/"
             async with aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
                 cookie_jar=aiohttp.DummyCookieJar(),
+                headers=req_headers,
             ) as session:
                 async with session.get(current_url, allow_redirects=False) as resp:
                     if resp.status in (301, 302, 303, 307, 308):
@@ -1741,11 +1766,25 @@ class MediaDownloader:
     async def _download_validated_hls_with_ytdlp(
         self,
         hls_url: str,
+        action: str,
         work_dir: Path,
         cookies_path: str | None,
         active_proxy: str | None,
     ) -> Path | None:
-        out_path = work_dir / "pin_hls.mp4"
+        if action == "480p":
+            hls_selector = (
+                "bv*[height<=480]+ba/b[height<=480]/"
+                "bv*[width<=480][height>480]+ba/b[width<=480][height>480]/bv*+ba/b"
+            )
+        elif action == "720p":
+            hls_selector = (
+                "bv*[height<=720]+ba/b[height<=720]/"
+                "bv*[width<=720][height>720]+ba/b[width<=720][height>720]/bv*+ba/b"
+            )
+        else:
+            hls_selector = "bv*+ba/b"
+
+        outtmpl = str(work_dir / "pin_hls.%(ext)s")
         cmd = [
             sys.executable,
             "-m",
@@ -1758,20 +1797,28 @@ class MediaDownloader:
             "25",
             "--ies",
             "generic",
-            "--proto",
-            "+https,-file,-ftp,-gopher",
+            "--user-agent",
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "--add-header",
+            "Referer:https://www.pinterest.com/",
             "--no-simulate",
             "--no-quiet",
             "--no-progress",
             "--no-playlist",
+            "--no-part",
+            "--print",
+            "after_move:filepath",
             "--max-filesize",
             f"{settings.MAX_RAW_DOWNLOAD_MB}M",
             "-f",
-            "best",
+            hls_selector,
             "--merge-output-format",
             "mp4",
             "-o",
-            str(out_path),
+            outtmpl,
         ]
         if active_proxy:
             cmd.extend(["--proxy", active_proxy])
@@ -1784,12 +1831,41 @@ class MediaDownloader:
             timeout=settings.effective_download_timeout,
             max_stdout_bytes=4 * 1024 * 1024,
         )
-        combined = f"{stdout_b.decode('utf-8', errors='replace')}\n{stderr_b.decode('utf-8', errors='replace')}".lower()
+        stdout_txt = stdout_b.decode("utf-8", errors="replace")
+        stderr_txt = stderr_b.decode("utf-8", errors="replace")
+        combined_raw = f"{stdout_txt}\n{stderr_txt}"
+        combined = combined_raw.lower()
         if "max-filesize" in combined or "file is larger" in combined:
             raise DownloadUserError("Видео превышает максимально допустимый размер загрузки.")
-        if rc == 0 and out_path.is_file() and out_path.stat().st_size > 0:
-            return out_path
-        out_path.unlink(missing_ok=True)
+
+        work_root = work_dir.resolve()
+        if rc == 0:
+            for raw_line in reversed(stdout_txt.splitlines()):
+                cand_str = raw_line.strip()
+                if not cand_str:
+                    continue
+                try:
+                    resolved = Path(cand_str).resolve()
+                except OSError:
+                    continue
+                if resolved.is_relative_to(work_root) and resolved.is_file() and resolved.stat().st_size > 0:
+                    return resolved
+            for cand in work_dir.iterdir():
+                if (
+                    cand.is_file()
+                    and cand.name.startswith("pin_hls.")
+                    and cand.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4a"}
+                    and cand.stat().st_size > 0
+                ):
+                    return cand
+
+        logger.warning(
+            "Pinterest HLS fallback failed (rc=%s): %s",
+            rc,
+            sanitize_secrets(combined_raw, settings.BOT_TOKEN)[-300:],
+        )
+        for stale in work_dir.glob("pin_hls*"):
+            stale.unlink(missing_ok=True)
         return None
 
     async def _finalize_single_media(
@@ -1883,7 +1959,7 @@ class MediaDownloader:
         for idx, cand in enumerate(mp4_cands):
             try:
                 cand_url = await validate_external_url(cand["url"], uses_proxy=bool(active_proxy))
-                if not _is_trusted_pinterest_cdn_url(cand_url):
+                if not (_is_trusted_pinterest_cdn_url(cand_url) or _is_pinterest_url(cand_url)):
                     continue
                 dest = work_dir / f"pin_direct_{idx}.mp4"
                 await self._stream_external_download(
@@ -1909,10 +1985,11 @@ class MediaDownloader:
                     hls_url = await validate_external_url(cand["url"], uses_proxy=bool(active_proxy))
                 except URLValidationError:
                     continue
-                if not _is_trusted_pinterest_cdn_url(hls_url):
+                if not (_is_trusted_pinterest_cdn_url(hls_url) or _is_pinterest_url(hls_url)):
                     continue
                 target_file = await self._download_validated_hls_with_ytdlp(
                     hls_url=hls_url,
+                    action=action,
                     work_dir=work_dir,
                     cookies_path=cookies_path,
                     active_proxy=active_proxy,
