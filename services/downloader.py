@@ -43,7 +43,16 @@ _GALLERY_HOSTS = (
     "redd.it",
     "imgur.com",
     "tiktok.com",
+    "tiktokv.com",
 )
+_PINTEREST_HOSTS = ("pinterest.", "pin.it")
+_PINTEREST_CDN_HOSTS = ("pinimg.com",)
+_TIKTOK_HOSTS = ("tiktok.com", "tiktokv.com")
+_TIKTOK_PHOTO_PATH_RE = re.compile(
+    r"^/(?:@[\w.-]*|share)/photo/\d+(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+_PINTEREST_PIN_ID_RE = re.compile(r"/pin/(?:[\w-]+--)?(\d+)(?:[/?#]|$)", re.IGNORECASE)
 _CAROUSEL_EXTRACTORS = ("instagram", "twitter", "tiktok", "reddit", "pinterest")
 _PLAYLIST_OR_PROFILE_EXTRACTORS = (
     "youtubetab",
@@ -355,20 +364,73 @@ def _is_profile_or_board_url(url: str) -> bool:
     return any(pattern.match(url.strip()) for pattern in _PROFILE_PATH_PATTERNS)
 
 
-def _is_gallery_candidate_url(url: str) -> bool:
+def _host_matches_domains(url: str, domains: tuple[str, ...]) -> bool:
+    """Return True if URL's hostname matches any exact, subdomain, or prefix domain rule."""
     try:
         host = (urlparse(url).hostname or "").lower().rstrip(".")
     except ValueError:
         return False
     if not host:
         return False
-    for domain in _GALLERY_ALLOWED_HOSTS:
+    for domain in domains:
         if domain.endswith("."):
             if host.startswith(domain) or f".{domain}" in host:
                 return True
         elif host == domain or host.endswith(f".{domain}"):
             return True
     return False
+
+
+def _is_gallery_candidate_url(url: str) -> bool:
+    return _host_matches_domains(url, _GALLERY_ALLOWED_HOSTS)
+
+
+def _is_tiktok_url(url: str) -> bool:
+    return _host_matches_domains(url, _TIKTOK_HOSTS)
+
+
+def _is_tiktok_photo_url(url: str) -> bool:
+    if not _is_tiktok_url(url):
+        return False
+    try:
+        path = urlparse(url).path or ""
+    except ValueError:
+        return False
+    return bool(_TIKTOK_PHOTO_PATH_RE.match(path))
+
+
+def _is_pinterest_url(url: str) -> bool:
+    return _host_matches_domains(url, _PINTEREST_HOSTS)
+
+
+def _is_trusted_pinterest_cdn_url(url: str) -> bool:
+    return _host_matches_domains(url, _PINTEREST_CDN_HOSTS)
+
+
+def _gallery_dl_common_args(
+    url: str, active_proxy: str | None, cookies_path: str | None
+) -> list[str]:
+    """Build common gallery-dl invocation arguments without shell config side effects."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "gallery_dl",
+        "--config-ignore",
+    ]
+    if _is_tiktok_url(url):
+        cmd.extend(
+            [
+                "-o",
+                "extractor.tiktok.audio=false",
+                "-o",
+                "extractor.tiktok.covers=false",
+            ]
+        )
+    if active_proxy:
+        cmd.extend(["--proxy", active_proxy])
+    if cookies_path:
+        cmd.extend(["--cookies", cookies_path])
+    return cmd
 
 
 def _ytdlp_common_args(
@@ -586,30 +648,125 @@ def _map_ytdlp_error(stderr_text: str) -> DownloadUserError:
     return DownloadUserError("Не удалось обработать ссылку.")
 
 
+_HARD_YTDLP_FAILURE_TOKENS = (
+    "private video",
+    "is private",
+    "sign in",
+    "login required",
+    "429",
+    "too many requests",
+    "unable to connect to proxy",
+    "socks",
+    "timed out",
+)
+
+
 def _should_fallback_to_gallery_dl(url: str, stderr_text: str) -> bool:
-    low = stderr_text.lower()
-    hard_blocks = (
-        "private video",
-        "is private",
-        "sign in",
-        "login required",
-        "429",
-        "too many requests",
-        "unable to connect to proxy",
-        "socks",
-        "timed out",
-    )
-    if any(token in low for token in hard_blocks):
+    """Return True when a failing yt-dlp call on a social/gallery host should try gallery-dl."""
+    if not _is_gallery_candidate_url(url):
         return False
-    no_video_markers = (
-        "no video formats found",
-        "there is no video in this post",
-        "no video could be found",
-        "unsupported url",
-    )
-    if any(marker in low for marker in no_video_markers) and _is_gallery_candidate_url(url):
-        return True
-    return False
+    low = stderr_text.lower()
+    return not any(token in low for token in _HARD_YTDLP_FAILURE_TOKENS)
+
+
+def _extract_pinterest_video_candidates(
+    meta: dict[str, Any], primary_url: str = ""
+) -> tuple[list[dict[str, Any]], int]:
+    """Collect video stream candidates and duration (seconds) from gallery-dl Pinterest pin metadata."""
+    candidates: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    max_dur = 0
+
+    def _add_candidate(
+        raw_url: Any,
+        fmt_id: str = "",
+        width: Any = 0,
+        height: Any = 0,
+        dur_sec: float = 0.0,
+    ) -> None:
+        nonlocal max_dur
+        if not isinstance(raw_url, str):
+            return
+        cand_url = raw_url[5:] if raw_url.startswith("ytdl:") else raw_url
+        if not cand_url.startswith(("http://", "https://")) or cand_url in seen_urls:
+            return
+        seen_urls.add(cand_url)
+        w = int(width or 0)
+        h = int(height or 0)
+        d = max(0, int(round(dur_sec))) if dur_sec > 0 else 0
+        if d > max_dur:
+            max_dur = d
+        path_lower = urlparse(cand_url).path.lower()
+        is_hls = (
+            "hls" in fmt_id.lower()
+            or path_lower.endswith(".m3u8")
+            or ".m3u8" in cand_url.lower()
+        )
+        candidates.append(
+            {
+                "url": cand_url,
+                "format_id": fmt_id,
+                "width": w,
+                "height": h,
+                "is_hls": is_hls,
+            }
+        )
+
+    def _collect_video_list(vlist: Any) -> None:
+        if not isinstance(vlist, dict):
+            return
+        for fmt_id, fdict in vlist.items():
+            if not isinstance(fdict, dict):
+                continue
+            raw_dur = float(fdict.get("duration") or 0)
+            dur_sec = raw_dur / 1000.0 if raw_dur > 0 else 0.0
+            _add_candidate(
+                fdict.get("url"),
+                fmt_id=str(fmt_id),
+                width=fdict.get("width"),
+                height=fdict.get("height"),
+                dur_sec=dur_sec,
+            )
+
+    videos = meta.get("videos")
+    if isinstance(videos, dict):
+        _collect_video_list(videos.get("video_list"))
+    _collect_video_list(meta.get("video_list"))
+
+    story = meta.get("story_pin_data")
+    if isinstance(story, dict):
+        for page in story.get("pages") or []:
+            if not isinstance(page, dict):
+                continue
+            for block in page.get("blocks") or []:
+                if not isinstance(block, dict):
+                    continue
+                vid = block.get("video")
+                if isinstance(vid, dict):
+                    _collect_video_list(vid.get("video_list"))
+
+    fallback = meta.get("_fallback")
+    if isinstance(fallback, (list, tuple)):
+        for fb_url in fallback:
+            _add_candidate(
+                fb_url,
+                fmt_id="fallback",
+                width=meta.get("width"),
+                height=meta.get("height"),
+            )
+
+    if primary_url:
+        raw_meta_dur = float(meta.get("duration") or 0)
+        primary_dur = raw_meta_dur / 1000.0 if raw_meta_dur > 300 else raw_meta_dur
+        _add_candidate(
+            primary_url,
+            fmt_id="primary",
+            width=meta.get("width"),
+            height=meta.get("height"),
+            dur_sec=primary_dur,
+        )
+
+    return candidates, max_dur
 
 
 def _parse_gallery_dl_json(raw_bytes: bytes) -> list[Any]:
@@ -635,28 +792,29 @@ def _parse_gallery_dl_json(raw_bytes: bytes) -> list[Any]:
 
 
 class MediaDownloader:
-    async def _probe_gallery_metadata(
-        self, url: str, cookies_path: str | None, active_proxy: str | None
-    ) -> MediaInfo:
+    async def _collect_gallery_dl_items(
+        self,
+        url: str,
+        cookies_path: str | None,
+        active_proxy: str | None,
+        fallback_stderr: str = "",
+    ) -> dict[str, Any]:
+        """Run gallery-dl -J and return validated media items and metadata."""
         if _is_profile_or_board_url(url):
             raise DownloadUserError(
                 "Ссылки на профили и доски не поддерживаются. Отправьте ссылку на конкретный пост или пин."
             )
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "gallery_dl",
-            "--config-ignore",
-            "-J",
-            "--range",
-            f"1-{settings.MAX_GALLERY_ITEMS + 1}",
-        ]
-        if active_proxy:
-            cmd.extend(["--proxy", active_proxy])
-        if cookies_path:
-            cmd.extend(["--cookies", cookies_path])
-        cmd.extend(["--", url])
+        cmd = _gallery_dl_common_args(url, active_proxy, cookies_path)
+        cmd.extend(
+            [
+                "-J",
+                "--range",
+                f"1-{settings.MAX_GALLERY_ITEMS + 1}",
+                "--",
+                url,
+            ]
+        )
 
         rc, stdout_b, stderr_b = await _run_subprocess(
             cmd,
@@ -668,12 +826,18 @@ class MediaDownloader:
                 raise DownloadUserError("Для этого контента требуются актуальные cookies.txt.")
             if rc & 8:
                 raise DownloadUserError("Сайт заблокировал запрос защитой от ботов.")
-            err_txt = sanitize_secrets(stderr_b.decode("utf-8", errors="replace"), settings.BOT_TOKEN)
+            err_txt = sanitize_secrets(
+                stderr_b.decode("utf-8", errors="replace"), settings.BOT_TOKEN
+            )
             logger.info("gallery-dl -J failed (rc=%s) for %s: %s", rc, url, err_txt[:300])
+            combined_low = f"{fallback_stderr}\n{err_txt}".lower()
+            if any(tok in combined_low for tok in ("404", "not found", "been deleted")):
+                raise DownloadUserError("Медиа недоступно или было удалено.")
             raise DownloadUserError("Не удалось извлечь медиа по данной ссылке.")
 
         events = _parse_gallery_dl_json(stdout_b)
-        asset_urls: list[str] = []
+        assets: list[tuple[str, dict[str, Any], bool]] = []
+        meta_dicts: list[dict[str, Any]] = []
         thumb_candidate: str | None = None
         title = ""
         uploader = ""
@@ -684,21 +848,40 @@ class MediaDownloader:
             subcat = str(meta.get("subcategory") or "").lower()
             if cat in _BLOCKED_GALLERY_CATEGORIES or subcat in _BLOCKED_GALLERY_SUBCATEGORIES:
                 raise DownloadUserError("Ссылки этого типа не поддерживаются.")
+            meta_dicts.append(meta)
             if not title:
                 title = str(
                     meta.get("title")
                     or meta.get("description")
+                    or meta.get("desc")
                     or meta.get("caption")
                     or meta.get("content")
                     or ""
                 ).strip()
             if not uploader:
                 author = meta.get("author")
-                author_name = author.get("name") if isinstance(author, dict) else ""
+                author_name = (
+                    (
+                        author.get("name")
+                        or author.get("nickname")
+                        or author.get("uniqueId")
+                        or ""
+                    )
+                    if isinstance(author, dict)
+                    else ""
+                )
+                pinner = meta.get("pinner")
+                pinner_name = (
+                    (pinner.get("full_name") or pinner.get("username") or "")
+                    if isinstance(pinner, dict)
+                    else ""
+                )
                 uploader = str(
                     meta.get("uploader")
                     or meta.get("username")
+                    or meta.get("user")
                     or author_name
+                    or pinner_name
                     or meta.get("nick")
                     or ""
                 ).strip()
@@ -708,6 +891,12 @@ class MediaDownloader:
                     if isinstance(val, str) and val.startswith(("http://", "https://")):
                         thumb_candidate = val
                         break
+            if not thumb_candidate:
+                images = meta.get("images")
+                orig = images.get("orig") if isinstance(images, dict) else None
+                orig_url = orig.get("url") if isinstance(orig, dict) else None
+                if isinstance(orig_url, str) and orig_url.startswith(("http://", "https://")):
+                    thumb_candidate = orig_url
 
         for ev in events:
             if not isinstance(ev, list) or len(ev) < 2:
@@ -716,28 +905,113 @@ class MediaDownloader:
             if tag == 2 and isinstance(ev[1], dict):
                 _inspect_meta_dict(ev[1])
             elif tag == 3 and isinstance(ev[1], str):
-                item_url = ev[1]
-                if len(ev) >= 3 and isinstance(ev[2], dict):
-                    _inspect_meta_dict(ev[2])
-                await validate_external_url(item_url, uses_proxy=bool(active_proxy))
-                asset_urls.append(item_url)
-                if not thumb_candidate:
-                    path_lower = urlparse(item_url).path.lower()
+                raw_item_url = ev[1]
+                item_meta: dict[str, Any] = (
+                    ev[2] if len(ev) >= 3 and isinstance(ev[2], dict) else {}
+                )
+                if item_meta:
+                    _inspect_meta_dict(item_meta)
+                item_ext = str(item_meta.get("extension") or "").lower()
+                item_type = str(item_meta.get("type") or "").lower()
+                if raw_item_url.startswith("text:") or item_ext == "txt" or item_type == "audio":
+                    continue
+                has_ytdl = raw_item_url.startswith("ytdl:")
+                clean_url = raw_item_url[5:] if has_ytdl else raw_item_url
+                await validate_external_url(clean_url, uses_proxy=bool(active_proxy))
+                path_lower = urlparse(clean_url).path.lower()
+                if not has_ytdl and (
+                    item_ext in _AUDIO_EXTS
+                    or any(path_lower.endswith(f".{ext}") for ext in _AUDIO_EXTS)
+                ):
+                    continue
+                assets.append((clean_url, item_meta, has_ytdl))
+                if not thumb_candidate and not has_ytdl:
                     if any(path_lower.endswith(f".{ext}") for ext in _IMAGE_EXTS):
-                        thumb_candidate = item_url
+                        thumb_candidate = clean_url
             elif tag == 6 and isinstance(ev[1], str):
                 if len(ev) >= 3 and isinstance(ev[2], dict):
                     _inspect_meta_dict(ev[2])
                 await validate_external_url(ev[1], uses_proxy=bool(active_proxy))
 
-        if not asset_urls:
+        if not assets:
             raise DownloadUserError("Не удалось найти медиафайлы по этой ссылке.")
+
+        return {
+            "assets": assets,
+            "meta_dicts": meta_dicts,
+            "title": title,
+            "uploader": uploader,
+            "thumb_url": thumb_candidate,
+        }
+
+    async def _probe_gallery_metadata(
+        self,
+        url: str,
+        cookies_path: str | None,
+        active_proxy: str | None,
+        fallback_stderr: str = "",
+    ) -> MediaInfo:
+        parsed = await self._collect_gallery_dl_items(
+            url, cookies_path, active_proxy, fallback_stderr=fallback_stderr
+        )
+        assets = parsed["assets"]
+
+        if _is_pinterest_url(url) and len(assets) == 1:
+            clean_url, item_meta, has_ytdl = assets[0]
+            merged_meta: dict[str, Any] = {}
+            for md in parsed["meta_dicts"]:
+                merged_meta.update(md)
+            merged_meta.update(item_meta)
+            item_ext = str(merged_meta.get("extension") or "").lower()
+            path_lower = urlparse(clean_url).path.lower()
+            is_video_pin = (
+                has_ytdl
+                or item_ext in _VIDEO_EXTS
+                or path_lower.endswith(".m3u8")
+                or any(path_lower.endswith(f".{ext}") for ext in _VIDEO_EXTS)
+                or (
+                    isinstance(merged_meta.get("videos"), dict)
+                    and not merged_meta.get("carousel_data")
+                )
+            )
+            if is_video_pin:
+                candidates, dur_sec = _extract_pinterest_video_candidates(merged_meta, clean_url)
+                target_url = url
+                pin_id = str(merged_meta.get("id") or "")
+                parsed_host = (urlparse(url).hostname or "").lower().rstrip(".")
+                if (
+                    parsed_host == "pin.it" or parsed_host.endswith(".pin.it")
+                ) and pin_id.isdigit():
+                    canon_cand = f"https://www.pinterest.com/pin/{pin_id}/"
+                    canon_proxy = settings.get_proxy_for_url(canon_cand) or active_proxy
+                    target_url = await validate_external_url(
+                        canon_cand, uses_proxy=bool(canon_proxy)
+                    )
+                dims = [
+                    min(c["width"], c["height"]) or c["height"]
+                    for c in candidates
+                    if c.get("width") or c.get("height")
+                ]
+                has_720p = any(0 < d <= 720 for d in dims)
+                has_480p = any(0 < d <= 480 for d in dims)
+                return MediaInfo(
+                    url=target_url,
+                    title=parsed["title"] or "Pinterest видео",
+                    uploader=parsed["uploader"] or "Pinterest",
+                    duration=dur_sec,
+                    thumbnail_url=parsed["thumb_url"],
+                    is_gallery=False,
+                    is_audio_only=False,
+                    can_best=True,
+                    can_720p=has_720p,
+                    can_480p=has_480p,
+                )
 
         return MediaInfo(
             url=url,
-            title=title or "Галерея / Пост",
-            uploader=uploader or "Источник по ссылке",
-            thumbnail_url=thumb_candidate,
+            title=parsed["title"] or "Галерея / Пост",
+            uploader=parsed["uploader"] or "Источник по ссылке",
+            thumbnail_url=parsed["thumb_url"],
             is_gallery=True,
         )
 
@@ -757,6 +1031,9 @@ class MediaDownloader:
         work_dir = Path(tempfile.mkdtemp(prefix="meta_", dir=settings.TEMP_DIR))
         try:
             cookies_path = _prepare_work_cookies(work_dir)
+            if _is_tiktok_photo_url(url):
+                return await self._probe_gallery_metadata(url, cookies_path, active_proxy)
+
             info = await self._extract_ytdlp_json(
                 url=url,
                 cookies_path=cookies_path,
@@ -772,8 +1049,24 @@ class MediaDownloader:
                 return await self._probe_gallery_metadata(url, cookies_path, active_proxy)
 
             est = _classify_and_estimate_formats(info)
-            limit_bytes = settings.effective_max_filesize_bytes
             is_audio_only = est["is_audio_only"]
+            if is_audio_only and _is_tiktok_url(url):
+                probe_url = url
+                webpage_url = info.get("webpage_url")
+                if isinstance(webpage_url, str) and _is_tiktok_url(webpage_url):
+                    try:
+                        wb_proxy = settings.get_proxy_for_url(webpage_url) or active_proxy
+                        probe_url = await validate_external_url(
+                            webpage_url, uses_proxy=bool(wb_proxy)
+                        )
+                    except URLValidationError:
+                        probe_url = url
+                try:
+                    return await self._probe_gallery_metadata(probe_url, cookies_path, active_proxy)
+                except DownloadUserError as exc:
+                    logger.info("TikTok slideshow gallery probe fell back to audio: %s", exc)
+
+            limit_bytes = settings.effective_max_filesize_bytes
             can_best = (est["size_best"] == 0) or (est["size_best"] <= limit_bytes)
             can_720p = est["has_720p"] and (
                 est["size_720p"] == 0 or est["size_720p"] <= limit_bytes
@@ -836,7 +1129,9 @@ class MediaDownloader:
 
         if rc != 0:
             if _should_fallback_to_gallery_dl(url, stderr_txt):
-                return await self._probe_gallery_metadata(url, cookies_path, active_proxy)
+                return await self._probe_gallery_metadata(
+                    url, cookies_path, active_proxy, fallback_stderr=stderr_txt
+                )
             raise _map_ytdlp_error(stderr_txt)
 
         try:
@@ -847,8 +1142,31 @@ class MediaDownloader:
         if not isinstance(info, dict):
             raise DownloadUserError("Пустые метаданные от источника.")
 
-        if info.get("is_live") or info.get("live_status") == "is_live":
+        if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
             raise DownloadUserError("Прямые трансляции не поддерживаются.")
+
+        if (
+            info.get("_type") in ("url", "url_transparent")
+            and isinstance(info.get("url"), str)
+            and not info.get("formats")
+            and depth < 1
+        ):
+            next_url = await validate_external_url(
+                info["url"], uses_proxy=bool(active_proxy)
+            )
+            resolved = await self._extract_ytdlp_json(
+                url=next_url,
+                cookies_path=cookies_path,
+                active_proxy=active_proxy,
+                work_dir=work_dir,
+                depth=depth + 1,
+            )
+            if isinstance(resolved, dict):
+                if not resolved.get("title") and info.get("title"):
+                    resolved["title"] = info["title"]
+                if not resolved.get("uploader") and info.get("uploader"):
+                    resolved["uploader"] = info["uploader"]
+            return resolved
 
         if info.get("_type") in ("playlist", "multi_video"):
             entries = [e for e in (info.get("entries") or []) if isinstance(e, dict)]
@@ -893,13 +1211,19 @@ class MediaDownloader:
 
         return info
 
-    async def _fetch_image_bytes(
-        self, image_url: str, source_url: str, max_bytes: int = _MAX_IMAGE_FETCH_BYTES
-    ) -> bytes:
+    async def _stream_external_download(
+        self,
+        target_url: str,
+        source_url: str,
+        max_bytes: int,
+        dest_path: Path | None = None,
+        timeout_sec: float = 20.0,
+    ) -> bytes | Path:
+        """Download an external HTTP(S) resource with SSRF redirect validation and size limits."""
         active_proxy = settings.get_proxy_for_url(source_url)
-        current_url = await validate_external_url(image_url, uses_proxy=bool(active_proxy))
+        current_url = await validate_external_url(target_url, uses_proxy=bool(active_proxy))
         aiohttp_proxy = normalize_aiohttp_proxy(active_proxy)
-        timeout = aiohttp.ClientTimeout(total=20, connect=10)
+        timeout = aiohttp.ClientTimeout(total=timeout_sec, connect=10)
 
         for _ in range(5):
             if aiohttp_proxy:
@@ -934,18 +1258,44 @@ class MediaDownloader:
                         )
                     content_length = resp.content_length
                     if content_length is not None and content_length > max_bytes:
-                        raise ValueError("Image exceeds size limit")
+                        raise ValueError("Resource exceeds size limit")
+
+                    total = 0
+                    if dest_path is not None:
+                        try:
+                            with dest_path.open("wb") as fh:
+                                async for chunk in resp.content.iter_chunked(65536):
+                                    total += len(chunk)
+                                    if total > max_bytes:
+                                        raise ValueError("Resource exceeds size limit")
+                                    fh.write(chunk)
+                            return dest_path
+                        except BaseException:
+                            dest_path.unlink(missing_ok=True)
+                            raise
 
                     chunks: list[bytes] = []
-                    total = 0
                     async for chunk in resp.content.iter_chunked(65536):
                         total += len(chunk)
                         if total > max_bytes:
-                            raise ValueError("Image exceeds size limit")
+                            raise ValueError("Resource exceeds size limit")
                         chunks.append(chunk)
                     return b"".join(chunks)
 
-        raise RuntimeError("Too many redirects while fetching image")
+        raise RuntimeError("Too many redirects while fetching external resource")
+
+    async def _fetch_image_bytes(
+        self, image_url: str, source_url: str, max_bytes: int = _MAX_IMAGE_FETCH_BYTES
+    ) -> bytes:
+        res = await self._stream_external_download(
+            target_url=image_url,
+            source_url=source_url,
+            max_bytes=max_bytes,
+            dest_path=None,
+            timeout_sec=20.0,
+        )
+        assert isinstance(res, bytes)
+        return res
 
     async def _convert_animated_webp_to_mp4(
         self, img: Image.Image, out_path: Path, work_dir: Path
@@ -1363,6 +1713,236 @@ class MediaDownloader:
         new_probe = await self.probe_media(out_path)
         return out_path, new_probe
 
+    async def _extract_mp3_from_file(self, input_path: Path, out_path: Path) -> Path:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            str(out_path),
+        ]
+        rc, _, stderr_b = await _run_subprocess(
+            cmd, timeout=settings.effective_compress_timeout
+        )
+        if rc != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
+            raise RuntimeError(
+                f"FFmpeg MP3 extraction failed: {stderr_b.decode('utf-8', errors='replace')[-250:]}"
+            )
+        input_path.unlink(missing_ok=True)
+        return out_path
+
+    async def _download_validated_hls_with_ytdlp(
+        self,
+        hls_url: str,
+        work_dir: Path,
+        cookies_path: str | None,
+        active_proxy: str | None,
+    ) -> Path | None:
+        out_path = work_dir / "pin_hls.mp4"
+        cmd = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--ignore-config",
+            "--encoding",
+            "utf-8",
+            "--geo-bypass",
+            "--socket-timeout",
+            "25",
+            "--ies",
+            "generic",
+            "--proto",
+            "+https,-file,-ftp,-gopher",
+            "--no-simulate",
+            "--no-quiet",
+            "--no-progress",
+            "--no-playlist",
+            "--max-filesize",
+            f"{settings.MAX_RAW_DOWNLOAD_MB}M",
+            "-f",
+            "best",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            str(out_path),
+        ]
+        if active_proxy:
+            cmd.extend(["--proxy", active_proxy])
+        if cookies_path:
+            cmd.extend(["--cookies", cookies_path])
+        cmd.extend(["--", hls_url])
+
+        rc, stdout_b, stderr_b = await _run_subprocess(
+            cmd,
+            timeout=settings.effective_download_timeout,
+            max_stdout_bytes=4 * 1024 * 1024,
+        )
+        combined = f"{stdout_b.decode('utf-8', errors='replace')}\n{stderr_b.decode('utf-8', errors='replace')}".lower()
+        if "max-filesize" in combined or "file is larger" in combined:
+            raise DownloadUserError("Видео превышает максимально допустимый размер загрузки.")
+        if rc == 0 and out_path.is_file() and out_path.stat().st_size > 0:
+            return out_path
+        out_path.unlink(missing_ok=True)
+        return None
+
+    async def _finalize_single_media(
+        self,
+        target_file: Path,
+        action: str,
+        work_dir: Path,
+        meta: MediaInfo,
+        source_url: str,
+    ) -> DownloadedMedia:
+        probe = await self.probe_media(target_file)
+        if action == "mp3" and not probe.has_audio:
+            raise DownloadUserError("В этом медиа отсутствует аудиодорожка.")
+
+        if action != "mp3" and target_file.stat().st_size <= settings.effective_max_filesize_bytes:
+            target_file, probe = await self._normalize_video_container(target_file, probe, work_dir)
+
+        thumb_path = await self.prepare_telegram_thumb(meta.thumbnail_url, work_dir, source_url)
+
+        return DownloadedMedia(
+            files=[target_file],
+            media_type="audio" if action == "mp3" else "video",
+            title=meta.title,
+            uploader=meta.uploader,
+            duration=probe.duration or meta.duration,
+            width=probe.width,
+            height=probe.height,
+            thumbnail_path=thumb_path,
+        )
+
+    async def _download_pinterest_video_fallback(
+        self,
+        url: str,
+        action: str,
+        work_dir: Path,
+        meta: MediaInfo,
+        cookies_path: str | None,
+        active_proxy: str | None,
+        fallback_stderr: str = "",
+    ) -> DownloadedMedia:
+        """Download a Pinterest video pin via gallery-dl metadata (direct MP4 first, then validated HLS)."""
+        parsed = await self._collect_gallery_dl_items(
+            url, cookies_path, active_proxy, fallback_stderr=fallback_stderr
+        )
+
+        merged_meta: dict[str, Any] = {}
+        for md in parsed["meta_dicts"]:
+            merged_meta.update(md)
+        all_candidates: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+
+        def _collect_cand(cands: list[dict[str, Any]]) -> None:
+            for cand in cands:
+                cu = cand["url"]
+                if cu not in seen_urls:
+                    seen_urls.add(cu)
+                    all_candidates.append(cand)
+
+        if merged_meta:
+            cands, _ = _extract_pinterest_video_candidates(merged_meta)
+            _collect_cand(cands)
+        for clean_url, item_meta, _ in parsed["assets"]:
+            combined = {**merged_meta, **item_meta} if item_meta else merged_meta
+            cands, _ = _extract_pinterest_video_candidates(combined, clean_url)
+            _collect_cand(cands)
+
+        if not all_candidates:
+            raise DownloadUserError("Не удалось найти видео в этом Pinterest-пине.")
+
+        def _cand_rank(cand: dict[str, Any]) -> tuple[int, int]:
+            dim = min(cand["width"], cand["height"]) or cand["height"] or 0
+            if action == "480p":
+                return (1 if 0 < dim <= 480 else 0, dim if dim <= 480 else -dim)
+            if action == "720p":
+                return (1 if 0 < dim <= 720 else 0, dim if dim <= 720 else -dim)
+            return (0, dim)
+
+        mp4_cands = sorted(
+            [c for c in all_candidates if not c["is_hls"]],
+            key=_cand_rank,
+            reverse=True,
+        )
+        hls_cands = sorted(
+            [c for c in all_candidates if c["is_hls"]],
+            key=_cand_rank,
+            reverse=True,
+        )
+
+        target_file: Path | None = None
+        max_raw_bytes = settings.MAX_RAW_DOWNLOAD_MB * 1024 * 1024
+        for idx, cand in enumerate(mp4_cands):
+            try:
+                cand_url = await validate_external_url(cand["url"], uses_proxy=bool(active_proxy))
+                if not _is_trusted_pinterest_cdn_url(cand_url):
+                    continue
+                dest = work_dir / f"pin_direct_{idx}.mp4"
+                await self._stream_external_download(
+                    target_url=cand_url,
+                    source_url=url,
+                    max_bytes=max_raw_bytes,
+                    dest_path=dest,
+                    timeout_sec=settings.effective_download_timeout,
+                )
+                if dest.is_file() and dest.stat().st_size > 0:
+                    target_file = dest
+                    break
+            except ValueError as exc:
+                if "exceeds size limit" in str(exc).lower():
+                    raise DownloadUserError("Видео превышает максимально допустимый размер загрузки.") from exc
+                logger.info("Pinterest direct MP4 download skipped (%s): %s", cand["url"], exc)
+            except (aiohttp.ClientError, asyncio.TimeoutError, URLValidationError, RuntimeError) as exc:
+                logger.info("Pinterest direct MP4 failed (%s): %s", cand["url"], exc)
+
+        if target_file is None:
+            for cand in hls_cands:
+                try:
+                    hls_url = await validate_external_url(cand["url"], uses_proxy=bool(active_proxy))
+                except URLValidationError:
+                    continue
+                if not _is_trusted_pinterest_cdn_url(hls_url):
+                    continue
+                target_file = await self._download_validated_hls_with_ytdlp(
+                    hls_url=hls_url,
+                    work_dir=work_dir,
+                    cookies_path=cookies_path,
+                    active_proxy=active_proxy,
+                )
+                if target_file is not None:
+                    break
+
+        if target_file is None:
+            if fallback_stderr:
+                raise _map_ytdlp_error(sanitize_secrets(fallback_stderr, settings.BOT_TOKEN))
+            raise DownloadUserError("Не удалось скачать видео с Pinterest.")
+
+        if action == "mp3":
+            probe = await self.probe_media(target_file)
+            if not probe.has_audio:
+                raise DownloadUserError("В этом медиа отсутствует аудиодорожка для извлечения MP3.")
+            target_file = await self._extract_mp3_from_file(
+                target_file, work_dir / f"{target_file.stem}.mp3"
+            )
+
+        effective_meta = MediaInfo(
+            url=meta.url,
+            title=meta.title or parsed["title"] or "Pinterest видео",
+            uploader=meta.uploader or parsed["uploader"] or "Pinterest",
+            duration=meta.duration,
+            thumbnail_url=meta.thumbnail_url or parsed["thumb_url"],
+            is_gallery=False,
+        )
+        return await self._finalize_single_media(target_file, action, work_dir, effective_meta, url)
+
     async def download_ytdlp(
         self, url: str, action: str, work_dir: Path, meta: MediaInfo
     ) -> DownloadedMedia:
@@ -1373,7 +1953,7 @@ class MediaDownloader:
         selector = _format_selector_for_action(action, settings.effective_max_filesize_mb)
         outtmpl = str(work_dir / "media_%(id)s.%(ext)s")
 
-        cmd = _ytdlp_common_args(url, cookies_path)
+        cmd = _ytdlp_common_args(url, cookies_path, proxy_override=active_proxy or "")
         cmd.extend(
             [
                 "--no-simulate",
@@ -1408,8 +1988,24 @@ class MediaDownloader:
         combined_output = f"{stdout_txt}\n{stderr_txt}"
 
         if rc != 0:
-            if "postprocessing" in combined_output.lower() and action == "mp3":
+            low_out = combined_output.lower()
+            if "postprocessing" in low_out and action == "mp3":
                 raise DownloadUserError("В этом медиа отсутствует аудиодорожка для извлечения MP3.")
+            if (
+                _is_pinterest_url(url)
+                and "max-filesize" not in low_out
+                and "file is larger" not in low_out
+                and not any(tok in low_out for tok in _HARD_YTDLP_FAILURE_TOKENS)
+            ):
+                return await self._download_pinterest_video_fallback(
+                    url=url,
+                    action=action,
+                    work_dir=work_dir,
+                    meta=meta,
+                    cookies_path=cookies_path,
+                    active_proxy=active_proxy,
+                    fallback_stderr=combined_output,
+                )
             raise _map_ytdlp_error(sanitize_secrets(combined_output, settings.BOT_TOKEN))
 
         target_file: Path | None = None
@@ -1446,25 +2042,7 @@ class MediaDownloader:
         if target_file is None:
             raise RuntimeError("Файл не был создан после загрузки yt-dlp.")
 
-        probe = await self.probe_media(target_file)
-        if action == "mp3" and not probe.has_audio:
-            raise DownloadUserError("В этом медиа отсутствует аудиодорожка.")
-
-        if action != "mp3" and target_file.stat().st_size <= settings.effective_max_filesize_bytes:
-            target_file, probe = await self._normalize_video_container(target_file, probe, work_dir)
-
-        thumb_path = await self.prepare_telegram_thumb(meta.thumbnail_url, work_dir, url)
-
-        return DownloadedMedia(
-            files=[target_file],
-            media_type="audio" if action == "mp3" else "video",
-            title=meta.title,
-            uploader=meta.uploader,
-            duration=probe.duration or meta.duration,
-            width=probe.width,
-            height=probe.height,
-            thumbnail_path=thumb_path,
-        )
+        return await self._finalize_single_media(target_file, action, work_dir, meta, url)
 
     async def download_gallery(
         self, url: str, work_dir: Path, meta: MediaInfo
@@ -1477,27 +2055,23 @@ class MediaDownloader:
         gallery_dir.mkdir(parents=True, exist_ok=True)
         gallery_root = gallery_dir.resolve()
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "gallery_dl",
-            "--config-ignore",
-            "--no-mtime",
-            "-d",
-            str(gallery_dir),
-            "-o",
-            "extractor.directory=[]",
-            "-o",
-            "extractor.filename={num:?//0>4}_{filename}.{extension}",
-            "--range",
-            f"1-{settings.MAX_GALLERY_ITEMS + 1}",
-            "--no-part",
-        ]
-        if active_proxy:
-            cmd.extend(["--proxy", active_proxy])
-        if cookies_path:
-            cmd.extend(["--cookies", cookies_path])
-        cmd.extend(["--", url])
+        cmd = _gallery_dl_common_args(url, active_proxy, cookies_path)
+        cmd.extend(
+            [
+                "--no-mtime",
+                "-d",
+                str(gallery_dir),
+                "-o",
+                "extractor.directory=[]",
+                "-o",
+                "extractor.filename={num:?//0>4}_{filename}.{extension}",
+                "--range",
+                f"1-{settings.MAX_GALLERY_ITEMS + 1}",
+                "--no-part",
+                "--",
+                url,
+            ]
+        )
 
         rc, _, stderr_b = await _run_subprocess(
             cmd, timeout=settings.effective_download_timeout

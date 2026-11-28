@@ -250,3 +250,303 @@ def test_is_gallery_candidate_url_strict_domains():
     assert _is_gallery_candidate_url("https://pin.it/abc") is True
     assert _is_gallery_candidate_url("https://ru.pinterest.com/pin/123/") is True
 
+
+@pytest.mark.asyncio
+async def test_tiktok_photo_urls_and_audio_only_slideshows_route_to_gallery(monkeypatch):
+    dl = MediaDownloader()
+    calls = []
+
+    async def fake_photo_only(cmd, **kwargs):
+        calls.append(cmd)
+        assert "gallery_dl" in cmd
+        assert "extractor.tiktok.audio=false" in cmd
+        events = [
+            [2, {"category": "tiktok", "subcategory": "post", "user": "artist", "desc": "Drawings"}],
+            [3, "https://p16-sign.tiktokcdn.com/img1.jpeg", {"category": "tiktok", "type": "image"}],
+            [3, "https://sf16-music.tiktokcdn.com/sound.mp3", {"category": "tiktok", "type": "audio"}],
+            [3, "https://p16-sign.tiktokcdn.com/img2.jpeg", {"category": "tiktok", "type": "image"}],
+        ]
+        return 0, json.dumps(events).encode("utf-8"), b""
+
+    monkeypatch.setattr("services.downloader._run_subprocess", fake_photo_only)
+    meta = await dl.extract_metadata("https://www.tiktok.com/@artist/photo/7345678901234567890")
+    assert meta.is_gallery is True
+    assert meta.title == "Drawings"
+    assert meta.thumbnail_url == "https://p16-sign.tiktokcdn.com/img1.jpeg"
+    assert len(calls) == 1
+
+    # Audio-only /video/<id> slideshow from yt-dlp must probe gallery-dl for images
+    async def fake_slideshow_video_url(cmd, **kwargs):
+        if "yt_dlp" in cmd:
+            payload = {
+                "id": "7253412088251534594",
+                "title": "Slideshow",
+                "uploader": "creator",
+                "webpage_url": "https://www.tiktok.com/@creator/video/7253412088251534594",
+                "formats": [
+                    {"format_id": "0", "ext": "m4a", "vcodec": "none", "acodec": "aac", "filesize": 400_000}
+                ],
+            }
+            return 0, json.dumps(payload).encode("utf-8"), b""
+        events = [
+            [2, {"category": "tiktok", "subcategory": "post", "user": "creator", "title": "Slideshow"}],
+            [3, "https://p16-sign.tiktokcdn.com/slide1.jpg", {"category": "tiktok", "type": "image"}],
+        ]
+        return 0, json.dumps(events).encode("utf-8"), b""
+
+    monkeypatch.setattr("services.downloader._run_subprocess", fake_slideshow_video_url)
+    meta2 = await dl.extract_metadata("https://vt.tiktok.com/ZSYabc123/")
+    assert meta2.is_gallery is True
+    assert meta2.thumbnail_url == "https://p16-sign.tiktokcdn.com/slide1.jpg"
+
+    # Generic yt-dlp extractor failure on TikTok falls back cleanly to gallery-dl
+    async def fake_tiktok_ytdlp_error(cmd, **kwargs):
+        if "yt_dlp" in cmd:
+            return 1, b"", b"ERROR: [TikTok] 123: Unable to extract webpage video data"
+        events = [
+            [2, {"category": "tiktok", "subcategory": "post", "user": "u1", "desc": "Art"}],
+            [3, "https://p16-sign.tiktokcdn.com/art.jpg", {"category": "tiktok", "type": "image"}],
+        ]
+        return 0, json.dumps(events).encode("utf-8"), b""
+
+    monkeypatch.setattr("services.downloader._run_subprocess", fake_tiktok_ytdlp_error)
+    meta3 = await dl.extract_metadata("https://vt.tiktok.com/ZSYfallback/")
+    assert meta3.is_gallery is True
+    assert meta3.uploader == "u1"
+
+
+@pytest.mark.asyncio
+async def test_pinterest_pin_it_and_video_fallback(monkeypatch, tmp_path):
+    dl = MediaDownloader()
+
+    # pin.it short link resolving to HLS ("ytdl:...") + V_720P MP4 video pin
+    async def fake_pin_it_meta(cmd, **kwargs):
+        if "yt_dlp" in cmd:
+            return 1, b"", b"ERROR: Unsupported URL: https://pin.it/xyz123"
+        events = [
+            [
+                2,
+                {
+                    "category": "pinterest",
+                    "subcategory": "pin",
+                    "id": "664281013778109217",
+                    "description": "Origami Video",
+                    "pinner": {"full_name": "Paper Artist"},
+                    "images": {"orig": {"url": "https://i.pinimg.com/originals/aa/bb/thumb.jpg"}},
+                    "videos": {
+                        "video_list": {
+                            "V_HLSV4": {
+                                "url": "https://v1.pinimg.com/videos/iht/hls/a/b/720p.m3u8",
+                                "width": 720,
+                                "height": 1280,
+                                "duration": 15000,
+                            },
+                            "V_720P": {
+                                "url": "https://v1.pinimg.com/videos/mc/720p/a/b/vid.mp4",
+                                "width": 720,
+                                "height": 1280,
+                                "duration": 15000,
+                            },
+                        }
+                    },
+                },
+            ],
+            [
+                3,
+                "ytdl:https://v1.pinimg.com/videos/iht/hls/a/b/720p.m3u8",
+                {
+                    "category": "pinterest",
+                    "subcategory": "pin",
+                    "id": "664281013778109217",
+                    "extension": "mp4",
+                    "_fallback": ["https://v1.pinimg.com/videos/mc/720p/a/b/vid.mp4"],
+                },
+            ],
+        ]
+        return 0, json.dumps(events).encode("utf-8"), b""
+
+    monkeypatch.setattr("services.downloader._run_subprocess", fake_pin_it_meta)
+    pin_meta = await dl.extract_metadata("https://pin.it/xyz123")
+    assert pin_meta.is_gallery is False
+    assert pin_meta.url == "https://www.pinterest.com/pin/664281013778109217/"
+    assert pin_meta.duration == 15
+    assert pin_meta.uploader == "Paper Artist"
+    assert pin_meta.thumbnail_url == "https://i.pinimg.com/originals/aa/bb/thumb.jpg"
+    assert pin_meta.can_best is True
+    assert pin_meta.can_720p is True
+
+    # download_ytdlp falls back to direct V_720P MP4 when yt-dlp fails on Pinterest
+    async def fake_sub_download(cmd, **kwargs):
+        if "yt_dlp" in cmd:
+            return 1, b"", b"ERROR: [Pinterest] 664281013778109217: HTTP Error 403: Forbidden"
+        events = [
+            [
+                3,
+                "ytdl:https://v1.pinimg.com/videos/iht/hls/a/b/720p.m3u8",
+                {
+                    "category": "pinterest",
+                    "subcategory": "pin",
+                    "id": "664281013778109217",
+                    "videos": {
+                        "video_list": {
+                            "V_720P": {
+                                "url": "https://v1.pinimg.com/videos/mc/720p/a/b/vid.mp4",
+                                "width": 720,
+                                "height": 1280,
+                                "duration": 15000,
+                            }
+                        }
+                    },
+                },
+            ]
+        ]
+        return 0, json.dumps(events).encode("utf-8"), b""
+
+    fetched_urls = []
+
+    async def fake_stream(target_url, source_url, max_bytes, dest_path=None, timeout_sec=20.0):
+        fetched_urls.append(target_url)
+        assert dest_path is not None
+        dest_path.write_bytes(b"ftypmp42_fake_video")
+        return dest_path
+
+    async def fake_probe(path):
+        return MediaItemProbe(duration=15, width=720, height=1280, has_audio=True, vcodec="h264", acodec="aac", pix_fmt="yuv420p")
+
+    async def fake_norm(path, probe, wdir):
+        return path, probe
+
+    async def fake_thumb(thumb_url, wdir, src):
+        return None
+
+    monkeypatch.setattr("services.downloader._run_subprocess", fake_sub_download)
+    monkeypatch.setattr(dl, "_stream_external_download", fake_stream)
+    monkeypatch.setattr(dl, "probe_media", fake_probe)
+    monkeypatch.setattr(dl, "_normalize_video_container", fake_norm)
+    monkeypatch.setattr(dl, "prepare_telegram_thumb", fake_thumb)
+
+    res = await dl.download_ytdlp(pin_meta.url, "best", tmp_path, pin_meta)
+    assert res.media_type == "video"
+    assert res.duration == 15
+    assert res.width == 720
+    assert fetched_urls == ["https://v1.pinimg.com/videos/mc/720p/a/b/vid.mp4"]
+
+    # Silent Pinterest video refuses mp3 cleanly
+    async def fake_probe_silent(path):
+        return MediaItemProbe(duration=15, width=720, height=1280, has_audio=False, vcodec="h264", acodec="", pix_fmt="yuv420p")
+
+    monkeypatch.setattr(dl, "probe_media", fake_probe_silent)
+    with pytest.raises(DownloadUserError, match="отсутствует аудиодорожка"):
+        await dl.download_ytdlp(pin_meta.url, "mp3", tmp_path, pin_meta)
+
+
+@pytest.mark.asyncio
+async def test_tiktok_pure_audio_and_pinterest_url_transparent_and_hls_fallback(monkeypatch, tmp_path):
+    dl = MediaDownloader()
+
+    # Pure-audio TikTok /video/<id> without imagePost stays audio-only instead of failing
+    async def fake_pure_audio_tiktok(cmd, **kwargs):
+        if "yt_dlp" in cmd:
+            payload = {
+                "id": "70001",
+                "title": "Just Sound",
+                "uploader": "dj",
+                "webpage_url": "https://www.tiktok.com/@dj/video/70001",
+                "formats": [
+                    {"format_id": "0", "ext": "m4a", "vcodec": "none", "acodec": "aac", "filesize": 300_000}
+                ],
+            }
+            return 0, json.dumps(payload).encode("utf-8"), b""
+        # gallery-dl yields only audio -> skipped -> "no assets" -> keeps audio-only
+        events = [
+            [2, {"category": "tiktok", "subcategory": "post", "user": "dj"}],
+            [3, "https://sf16-music.tiktokcdn.com/track.mp3", {"category": "tiktok", "type": "audio"}],
+        ]
+        return 0, json.dumps(events).encode("utf-8"), b""
+
+    monkeypatch.setattr("services.downloader._run_subprocess", fake_pure_audio_tiktok)
+    tk_audio_meta = await dl.extract_metadata("https://www.tiktok.com/@dj/video/70001")
+    assert tk_audio_meta.is_gallery is False
+    assert tk_audio_meta.is_audio_only is True
+
+    # Top-level url_transparent unwrapping on Pinterest embed pin
+    yt_calls = []
+
+    async def fake_url_transparent(cmd, **kwargs):
+        yt_calls.append(cmd)
+        target = cmd[-1]
+        if "pinterest.com" in target:
+            return 0, json.dumps(
+                {
+                    "_type": "url_transparent",
+                    "url": "https://vimeo.com/111691128",
+                    "title": "Pin Embed",
+                    "uploader": "PinUser",
+                }
+            ).encode("utf-8"), b""
+        return 0, json.dumps(
+            {
+                "id": "111691128",
+                "duration": 22,
+                "formats": [
+                    {"ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "height": 720, "filesize": 5_000_000}
+                ],
+            }
+        ).encode("utf-8"), b""
+
+    monkeypatch.setattr("services.downloader._run_subprocess", fake_url_transparent)
+    embed_meta = await dl.extract_metadata("https://www.pinterest.com/pin/441282463481903715/")
+    assert len(yt_calls) == 2
+    assert embed_meta.title == "Pin Embed"
+    assert embed_meta.uploader == "PinUser"
+    assert embed_meta.is_gallery is False
+
+    # HLS-only Pinterest fallback uses validated trusted pinimg CDN URL via --ies generic --proto +https
+    hls_cmds = []
+
+    async def fake_hls_only(cmd, **kwargs):
+        if "gallery_dl" in cmd:
+            events = [
+                [
+                    3,
+                    "ytdl:https://v1.pinimg.com/videos/iht/hls/x/y/720p.m3u8",
+                    {"category": "pinterest", "subcategory": "pin", "id": "999111"},
+                ]
+            ]
+            return 0, json.dumps(events).encode("utf-8"), b""
+        if "--ies" in cmd and "generic" in cmd:
+            hls_cmds.append(cmd)
+            out_idx = cmd.index("-o") + 1
+            Path(cmd[out_idx]).write_bytes(b"ftypmp42_hls")
+            return 0, b"", b""
+        return 1, b"", b"ERROR: [Pinterest] 999111: Unable to download JSON metadata"
+
+    async def fake_probe(path):
+        return MediaItemProbe(duration=12, width=720, height=1280, has_audio=True, vcodec="h264", acodec="aac", pix_fmt="yuv420p")
+
+    async def fake_norm(path, probe, wdir):
+        return path, probe
+
+    async def fake_thumb(thumb_url, wdir, src):
+        return None
+
+    monkeypatch.setattr("services.downloader._run_subprocess", fake_hls_only)
+    monkeypatch.setattr(dl, "probe_media", fake_probe)
+    monkeypatch.setattr(dl, "_normalize_video_container", fake_norm)
+    monkeypatch.setattr(dl, "prepare_telegram_thumb", fake_thumb)
+
+    hls_dir = tmp_path / "hls_run"
+    hls_dir.mkdir()
+    hls_res = await dl.download_ytdlp(
+        "https://www.pinterest.com/pin/999111/",
+        "best",
+        hls_dir,
+        MediaInfo(url="https://www.pinterest.com/pin/999111/", title="HLS Pin", uploader="P"),
+    )
+    assert hls_res.media_type == "video"
+    assert len(hls_cmds) == 1
+    assert "--ies" in hls_cmds[0] and "generic" in hls_cmds[0]
+    assert "--proxy" in hls_cmds[0]
+
+
+
